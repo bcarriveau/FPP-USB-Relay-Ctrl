@@ -1,0 +1,18 @@
+{
+    "repoName": "FPP-USB-Relay-Ctrl",
+    "name": "USB Relay Ctrl Plugin ",
+    "author": "Bill Carriveau",
+    "description": "A plugin that adds the 'USB Relay On/Off/AutoOff' command to control USB relays in FPP",
+    "homeURL": "https://github.com/bcarriveau/FPP-USB-Relay-Ctrl",
+    "srcURL": "https://github.com/bcarriveau/FPP-USB-Relay-Ctrl.git",
+    "bugURL": "https://github.com/bcarriveau/FPP-USB-Relay-Ctrl/issues",
+    "allowUpdates": 1,
+    "versions": [
+        {
+            "minFPPVersion": "8.0",
+            "maxFPPVersion": "0",
+            "branch": "main",
+            "sha": ""
+        }
+    ]
+}
