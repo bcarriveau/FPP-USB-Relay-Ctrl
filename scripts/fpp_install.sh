@@ -1,6 +1,4 @@
 #!/bin/bash
-# scripts/install
-#
 echo "Running install script for FPP-USB-Relay-Ctrl"
 CORE_SO="/usr/lib/libfpp-co-USBRelay.so"
 if [ ! -f "$CORE_SO" ]; then
