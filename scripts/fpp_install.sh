@@ -17,4 +17,4 @@ else
     echo "libfpp-co-USBRelay.so already present in /usr/lib/."
 fi
 echo "Install complete"
-echo "Note: Restart fppd to apply plugin updates (sudo systemctl restart fppd)"
+echo "Note: Restart fppd to apply plugin updates"
