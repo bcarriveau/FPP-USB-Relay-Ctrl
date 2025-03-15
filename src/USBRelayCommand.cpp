@@ -72,10 +72,10 @@ USBRelayCommand::USBRelayCommand() : Command("USB Relay On/Off", "Turns a USB re
     args.back().max = 8;
     args.back().defaultValue = "";
 
-    // State argument
+    // State argument - Removed blank option, no default selection
     args.emplace_back("State", "string", "Relay state", false);
-    args.back().defaultValue = "";
-    args.back().contentList = {"", "ON", "OFF", "ALL_OFF"};
+    args.back().contentList = {"ON", "OFF", "ALL_OFF"}; // No "" option
+    args.back().defaultValue = ""; // Empty default - nothing selected
 
     // Duration argument (in minutes)
     args.emplace_back("Duration", "int", "Duration in minutes to keep relay ON (0 for no auto-off)", true);
@@ -199,8 +199,9 @@ std::unique_ptr<Command::Result> USBRelayCommand::run(const std::vector<std::str
     std::string fullDevice = (device.find("/dev/") == 0) ? device : "/dev/" + device;
 
     if (state == "ALL_OFF") {
+        // Ignore channel if specified with ALL_OFF - simulates auto-clear by not enforcing empty
         if (!args[1].empty()) {
-            return std::make_unique<Command::ErrorResult>("Channel must be empty for ALL_OFF");
+            LogWarn(VB_COMMAND, "Channel specified (%s) with ALL_OFF, ignoring channel\n", args[1].c_str());
         }
         std::string resultStr = "Turned OFF all channels on: ";
         std::lock_guard<std::mutex> lock(USBRelayCommand::timerMutex);
