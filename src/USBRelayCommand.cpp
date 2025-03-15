@@ -66,16 +66,16 @@ USBRelayCommand::USBRelayCommand() : Command("USB Relay On/Off", "Turns a USB re
         LogWarn(VB_COMMAND, "co-other.json not found or invalid at %s, no USB relay devices available\n", configFile.c_str());
     }
 
-    // Channel argument
-    args.emplace_back("Channel", "int", "Relay channel (1-8). Leave empty for ALL_OFF.", true);
+    // Channel argument - Updated description
+    args.emplace_back("Channel", "int", "Relay channel (1-8). ALL_ON/OFF ignores input.", true);
     args.back().min = 1;
     args.back().max = 8;
     args.back().defaultValue = "";
 
-    // State argument - Removed blank option, no default selection
+    // State argument - Added ALL_ON, no blank option
     args.emplace_back("State", "string", "Relay state", false);
-    args.back().contentList = {"ON", "OFF", "ALL_OFF"}; // No "" option
-    args.back().defaultValue = ""; // Empty default - nothing selected
+    args.back().contentList = {"ON", "OFF", "ALL_ON", "ALL_OFF"};
+    args.back().defaultValue = ""; // No default selection
 
     // Duration argument (in minutes)
     args.emplace_back("Duration", "int", "Duration in minutes to keep relay ON (0 for no auto-off)", true);
@@ -105,12 +105,11 @@ void initializeICStation(const std::string& device) {
     }
     usleep(500000); // 500ms delay
 
-    // Add timeout to prevent hangs
     fd_set readfds;
     struct timeval timeout;
     FD_ZERO(&readfds);
     FD_SET(fd, &readfds);
-    timeout.tv_sec = 1; // 1-second timeout
+    timeout.tv_sec = 1;
     timeout.tv_usec = 0;
 
     int ret = select(fd + 1, &readfds, nullptr, nullptr, &timeout);
@@ -198,18 +197,18 @@ std::unique_ptr<Command::Result> USBRelayCommand::run(const std::vector<std::str
     std::string state = args[2];
     std::string fullDevice = (device.find("/dev/") == 0) ? device : "/dev/" + device;
 
-    if (state == "ALL_OFF") {
-        // Ignore channel if specified with ALL_OFF - simulates auto-clear by not enforcing empty
+    if (state == "ALL_OFF" || state == "ALL_ON") {
+        // Ignore channel input for ALL_ON/OFF
         if (!args[1].empty()) {
-            LogWarn(VB_COMMAND, "Channel specified (%s) with ALL_OFF, ignoring channel\n", args[1].c_str());
+            LogWarn(VB_COMMAND, "Channel specified (%s) with %s, ignoring channel\n", args[1].c_str(), state.c_str());
         }
-        std::string resultStr = "Turned OFF all channels on: ";
+        std::string resultStr = "Turned " + state.substr(4) + " all channels on: ";
         std::lock_guard<std::mutex> lock(USBRelayCommand::timerMutex);
         for (const auto& [dev, protoInfo] : USBRelayCommand::deviceProtocols) {
             std::string devPath = (dev.find("/dev/") == 0) ? dev : "/dev/" + dev;
             int fd = open(devPath.c_str(), O_WRONLY | O_NOCTTY);
             if (fd < 0) {
-                LogErr(VB_COMMAND, "Failed to open %s for ALL_OFF: %s\n", devPath.c_str(), strerror(errno));
+                LogErr(VB_COMMAND, "Failed to open %s for %s: %s\n", devPath.c_str(), state.c_str(), strerror(errno));
                 resultStr += dev + "(failed), ";
                 continue;
             }
@@ -218,26 +217,26 @@ std::unique_ptr<Command::Result> USBRelayCommand::run(const std::vector<std::str
 
             if (protocol == "CH340") {
                 for (int ch = 1; ch <= channelCount; ch++) {
-                    unsigned char cmd[4] = {0xA0, (unsigned char)ch, 0x00, 0};
+                    unsigned char cmd[4] = {0xA0, (unsigned char)ch, (state == "ALL_ON" ? 0x01 : 0x00), 0};
                     cmd[3] = cmd[0] + cmd[1] + cmd[2];
                     if (write(fd, cmd, 4) != 4) {
-                        LogErr(VB_COMMAND, "Failed to turn off channel %d on %s: %s\n", ch, devPath.c_str(), strerror(errno));
+                        LogErr(VB_COMMAND, "Failed to set channel %d on %s to %s: %s\n", ch, devPath.c_str(), state.c_str(), strerror(errno));
                     }
                 }
             } else if (protocol == "ICstation") {
                 if (USBRelayCommand::relayStates.find(devPath) == USBRelayCommand::relayStates.end()) {
                     initializeICStation(devPath);
                 }
-                USBRelayCommand::relayStates[devPath] = 0x00;
+                USBRelayCommand::relayStates[devPath] = (state == "ALL_ON" ? 0xFF : 0x00); // All on (255) or all off (0)
                 if (write(fd, &USBRelayCommand::relayStates[devPath], 1) != 1) {
-                    LogErr(VB_COMMAND, "Failed to turn off all channels on %s: %s\n", devPath.c_str(), strerror(errno));
+                    LogErr(VB_COMMAND, "Failed to set all channels on %s to %s: %s\n", devPath.c_str(), state.c_str(), strerror(errno));
                 }
             }
             close(fd);
             resultStr += dev + ", ";
         }
-        if (resultStr == "Turned OFF all channels on: ") {
-            return std::make_unique<Command::ErrorResult>("No devices configured for ALL_OFF");
+        if (resultStr == "Turned " + state.substr(4) + " all channels on: ") {
+            return std::make_unique<Command::ErrorResult>("No devices configured for " + state);
         }
         return std::make_unique<Command::Result>(resultStr.substr(0, resultStr.length() - 2));
     }
