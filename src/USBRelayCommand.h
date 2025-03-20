@@ -1,27 +1,38 @@
 #ifndef USBRELAYCOMMAND_H
 #define USBRELAYCOMMAND_H
 
+#include "fpp-pch.h"
 #include "commands/Commands.h"
+#include "Plugin.h"
+#include <string>
+#include <vector>
 #include <map>
 #include <thread>
-#include <atomic>
-#include <mutex>
+#include <chrono>
 
 class USBRelayCommand : public Command {
 public:
     USBRelayCommand();
+    virtual ~USBRelayCommand();
     virtual std::unique_ptr<Command::Result> run(const std::vector<std::string>& args) override;
+    virtual Json::Value getDescription() override;
 
-    // Static members
-    static std::map<std::string, std::thread> timerThreads;
-    static std::atomic<bool> shutdownFlag;
+private:
     static std::map<std::string, bool> activeTimers;
-    static std::mutex timerMutex;
-    static std::map<std::string, unsigned char> relayStates;
-    static std::map<std::string, std::pair<std::string, int>> deviceProtocols;
+    static std::map<std::string, int> deviceChannelCount;
+    static std::map<std::string, std::string> deviceProtocol;
+
+    static void initializeDevice(const std::string& device);
+    static void turnOnRelay(const std::string& device, int channel);
+    static void turnOffRelay(const std::string& device, int channel);
+    static unsigned char getRelayBitmask(const std::string& device, int channel, bool turnOn);
+    static void sendCH340Command(const std::string& device, int channel, bool turnOn);
 };
 
-void initializeICStation(const std::string& device);
-void cleanupThreads();
+class USBRelayPlugin : public FPPPlugin {
+public:
+    USBRelayPlugin();
+    virtual ~USBRelayPlugin();
+};
 
-#endif
+#endif // USBRELAYCOMMAND_H
