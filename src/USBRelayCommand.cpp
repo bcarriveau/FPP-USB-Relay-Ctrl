@@ -1,113 +1,32 @@
+#include "fpp-pch.h"
 #include "USBRelayCommand.h"
-#include <unistd.h>
+#include "commands/Commands.h"
+#include "Plugin.h"
+#include <thread>
+#include <chrono>
+#include <mutex>
 #include <fcntl.h>
-#include <termios.h>
+#include <unistd.h>
 #include <string.h>
-#include <map>
-#include <sys/stat.h>
+#include <sys/select.h>
+
+// Forward declaration of plugin_init
+extern "C" void plugin_init();
 
 // Static member definitions
+std::map<std::string, std::thread> USBRelayCommand::timerThreads;
+std::atomic<bool> USBRelayCommand::shutdownFlag{false};
 std::map<std::string, bool> USBRelayCommand::activeTimers;
-std::map<std::string, int> USBRelayCommand::deviceChannelCount;
-std::map<std::string, std::string> USBRelayCommand::deviceProtocol;
-static std::map<std::string, unsigned char> relayStates;
+std::mutex USBRelayCommand::timerMutex;
+std::map<std::string, unsigned char> USBRelayCommand::relayStates;
+std::map<std::string, std::pair<std::string, int>> USBRelayCommand::deviceProtocols;
 
-// Initialize device based on protocol
-void USBRelayCommand::initializeDevice(const std::string& device) {
-    // Set permissions for the device
-    if (chmod(device.c_str(), 0666) != 0) {
-        LogErr(VB_COMMAND, "Failed to set permissions for %s: %s\n", device.c_str(), strerror(errno));
-    }
-
-    int fd = open(device.c_str(), O_RDWR | O_NOCTTY);
-    if (fd < 0) {
-        LogErr(VB_COMMAND, "Failed to open %s for initialization: %s\n", device.c_str(), strerror(errno));
-        return;
-    }
-
-    std::string protocol = "ICstation"; // Default
-    int channelCount = 8; // Default for ICstation
-    std::string configFile = "/home/fpp/media/config/co-other.json";
-    Json::Value config;
-    if (FileExists(configFile) && LoadJsonFromFile(configFile, config)) {
-        LogDebug(VB_COMMAND, "Parsing co-other.json for %s\n", device.c_str());
-        if (config.isObject() && config.isMember("channelOutputs")) {
-            const Json::Value& outputs = config["channelOutputs"];
-            for (const auto& output : outputs) {
-                std::string devName = output.get("device", "").asString();
-                if (devName == device.substr(5)) {
-                    std::string subType = output.get("subType", "").asString();
-                    protocol = subType.empty() ? "ICstation" : subType;
-                    channelCount = output.get("channelCount", protocol == "CH340" ? 1 : 8).asInt();
-                    deviceChannelCount[device] = channelCount;
-                    deviceProtocol[device] = protocol;
-                    LogDebug(VB_COMMAND, "Detected %s with protocol %s, channels %d\n", devName.c_str(), protocol.c_str(), channelCount);
-                    break;
-                }
-            }
-        }
-    }
-    else {
-        LogWarn(VB_COMMAND, "co-other.json not found or invalid at %s, using defaults\n", configFile.c_str());
-    }
-
-    if (protocol == "ICstation") {
-        unsigned char c_init = 0x50;
-        unsigned char c_reply = 0x00;
-        unsigned char c_open = 0x51;
-
-        sleep(1);
-        write(fd, &c_init, 1);
-        LogDebug(VB_COMMAND, "Sent init 0x50 to %s\n", device.c_str());
-        usleep(500000);
-        read(fd, &c_reply, 1);
-        LogDebug(VB_COMMAND, "Handshake response: 0x%02X\n", c_reply);
-        write(fd, &c_open, 1);
-        LogDebug(VB_COMMAND, "Sent open 0x51 to %s\n", device.c_str());
-        unsigned char wakeCmd = 0x00;
-        write(fd, &wakeCmd, 1);
-        LogDebug(VB_COMMAND, "Sent wake 0x00 to %s\n", device.c_str());
-        usleep(100000);
-    }
-    else if (protocol == "CH340") {
-        LogDebug(VB_COMMAND, "Initialized %s as CH340\n", device.c_str());
-    }
-
-    close(fd);
-    relayStates[device] = 0x00;
-    LogDebug(VB_COMMAND, "Initialized %s with state 0x00\n", device.c_str());
-}
-
-// Send CH340-specific command
-void USBRelayCommand::sendCH340Command(const std::string& device, int channel, bool turnOn) {
-    int fd = open(device.c_str(), O_WRONLY | O_NOCTTY);
-    if (fd < 0) {
-        LogErr(VB_COMMAND, "Failed to open %s for CH340 command: %s\n", device.c_str(), strerror(errno));
-        return;
-    }
-    unsigned char cmd[4] = { 0xA0, (unsigned char)channel, (unsigned char)(turnOn ? 0x01 : 0x00), 0x00 };
-    cmd[3] = cmd[0] + cmd[1] + cmd[2]; // Checksum
-    if (write(fd, cmd, 4) != 4) {
-        LogErr(VB_COMMAND, "Failed to send CH340 command to %s, channel %d: %s\n", device.c_str(), channel, strerror(errno));
-    }
-    else {
-        LogDebug(VB_COMMAND, "Sent CH340 command to %s, channel %d, state %s\n", device.c_str(), channel, turnOn ? "ON" : "OFF");
-        unsigned char bitmask = relayStates[device];
-        if (turnOn) bitmask |= (1 << (channel - 1));
-        else bitmask &= ~(1 << (channel - 1));
-        relayStates[device] = bitmask;
-    }
-    close(fd);
-}
-
-USBRelayCommand::USBRelayCommand() : Command("USB Relay On/Off", "Controls USB relay with optional auto-off timer") {
-    LogDebug(VB_COMMAND, "Constructing USBRelayCommand\n");
-
+USBRelayCommand::USBRelayCommand() : Command("USB Relay On/Off", "Turns a USB relay channel ON or OFF, optionally for a specified duration in minutes") {
     // Device argument
     args.emplace_back("Device", "string", "USB Relay device from Others tab", false);
     std::string defaultDevice;
 
-    // Populate devices from co-other.json
+    // Populate devices and protocols from co-other.json
     std::string configFile = "/home/fpp/media/config/co-other.json";
     Json::Value config;
     if (FileExists(configFile) && LoadJsonFromFile(configFile, config)) {
@@ -119,9 +38,21 @@ USBRelayCommand::USBRelayCommand() : Command("USB Relay On/Off", "Controls USB r
                 for (const auto& output : outputs) {
                     std::string deviceName = output.get("device", "").asString();
                     std::string type = output.get("type", "").asString();
+                    std::string subType = output.get("subType", "").asString();
+                    int channelCount = output.get("channelCount", 8).asInt();
                     if (!deviceName.empty() && type == "USBRelay") {
+                        std::string protocol;
+                        if (subType == "CH340") {
+                            protocol = "CH340";
+                        } else if (subType == "ICStation") {
+                            protocol = "ICstation";
+                        } else {
+                            LogWarn(VB_COMMAND, "Unknown USBRelay subType '%s' for device %s, skipping\n", subType.c_str(), deviceName.c_str());
+                            continue;
+                        }
                         args.back().contentList.push_back(deviceName);
-                        LogDebug(VB_COMMAND, "Found device %s\n", deviceName.c_str());
+                        USBRelayCommand::deviceProtocols[deviceName] = std::make_pair(protocol, channelCount);
+                        LogDebug(VB_COMMAND, "Found device %s with protocol %s and %d channels\n", deviceName.c_str(), protocol.c_str(), channelCount);
                     }
                 }
                 if (!args.back().contentList.empty()) {
@@ -131,254 +62,311 @@ USBRelayCommand::USBRelayCommand() : Command("USB Relay On/Off", "Controls USB r
                 }
             }
         }
-    }
-    else {
+    } else {
         LogWarn(VB_COMMAND, "co-other.json not found or invalid at %s, no USB relay devices available\n", configFile.c_str());
     }
 
-    // Channel argument
-    args.emplace_back("Channel", "int", "Relay channel (1-8)", false);
+    // Channel argument - Updated description
+    args.emplace_back("Channel", "int", "Relay channel (1-8). ALL_ON/OFF ignores input.", true);
     args.back().min = 1;
     args.back().max = 8;
-    args.back().defaultValue = "1";
+    args.back().defaultValue = "";
 
-    // State argument
+    // State argument - Added ALL_ON, no blank option
     args.emplace_back("State", "string", "Relay state", false);
-    args.back().contentList = { "ON", "OFF", "ALL_ON", "ALL_OFF" };
-    args.back().defaultValue = "ON";
+    args.back().contentList = {"ON", "OFF", "ALL_ON", "ALL_OFF"};
+    args.back().defaultValue = ""; // No default selection
 
-    // Duration argument
-    args.emplace_back("Duration", "int", "Seconds to keep ON (0 for no auto-off)", true);
+    // Duration argument (in minutes)
+    args.emplace_back("Duration", "int", "Duration in minutes to keep relay ON (0 for no auto-off)", true);
     args.back().min = 0;
     args.back().max = 999;
     args.back().defaultValue = "0";
+
+    USBRelayCommand::shutdownFlag = false;
 }
 
-USBRelayCommand::~USBRelayCommand() {
-    // Clean up active timers
-    activeTimers.clear();
+void initializeICStation(const std::string& device) {
+    int fd = open(device.c_str(), O_RDWR | O_NOCTTY);
+    if (fd < 0) {
+        LogErr(VB_COMMAND, "Failed to open %s for ICStation initialization: %s\n", device.c_str(), strerror(errno));
+        return;
+    }
+
+    unsigned char c_init = 0x50;
+    unsigned char c_reply = 0x00;
+    unsigned char c_open = 0x51;
+
+    sleep(1);
+    if (write(fd, &c_init, 1) != 1) {
+        LogErr(VB_COMMAND, "Failed to write init command to %s: %s\n", device.c_str(), strerror(errno));
+        close(fd);
+        return;
+    }
+    usleep(500000); // 500ms delay
+
+    fd_set readfds;
+    struct timeval timeout;
+    FD_ZERO(&readfds);
+    FD_SET(fd, &readfds);
+    timeout.tv_sec = 1;
+    timeout.tv_usec = 0;
+
+    int ret = select(fd + 1, &readfds, nullptr, nullptr, &timeout);
+    if (ret > 0 && FD_ISSET(fd, &readfds)) {
+        if (read(fd, &c_reply, 1) == 1) {
+            LogDebug(VB_COMMAND, "ICStation handshake response from %s: 0x%02X\n", device.c_str(), c_reply);
+        } else {
+            LogWarn(VB_COMMAND, "Failed to read full handshake response from %s: %s\n", device.c_str(), strerror(errno));
+        }
+    } else if (ret == 0) {
+        LogWarn(VB_COMMAND, "Timeout waiting for ICStation handshake from %s\n", device.c_str());
+    } else {
+        LogErr(VB_COMMAND, "Select error on %s: %s\n", device.c_str(), strerror(errno));
+    }
+
+    if (write(fd, &c_open, 1) != 1 || write(fd, "\x00", 1) != 1) {
+        LogErr(VB_COMMAND, "Failed to write open/wake command to %s: %s\n", device.c_str(), strerror(errno));
+    }
+    usleep(100000); // 100ms delay
+    close(fd);
+
+    USBRelayCommand::relayStates[device] = 0x00;
+    LogDebug(VB_COMMAND, "Initialized ICStation device %s\n", device.c_str());
+}
+
+unsigned char getRelayBitmask(const std::string& device, int channel, bool turnOn) {
+    std::lock_guard<std::mutex> lock(USBRelayCommand::timerMutex);
+    if (USBRelayCommand::relayStates.find(device) == USBRelayCommand::relayStates.end()) {
+        USBRelayCommand::relayStates[device] = 0x00;
+    }
+    unsigned char bitmask = USBRelayCommand::relayStates[device];
+    if (turnOn) {
+        bitmask |= (1 << (channel - 1));
+    } else {
+        bitmask &= ~(1 << (channel - 1));
+    }
+    USBRelayCommand::relayStates[device] = bitmask;
+    return bitmask;
+}
+
+void turnOffAfterDelay(const std::string& device, int channel, const std::string& protocol, int durationMinutes, const std::string& key) {
+    LogDebug(VB_COMMAND, "Timer started for %s, channel %d, duration %d minutes\n", device.c_str(), channel, durationMinutes);
+    for (int i = 0; i < durationMinutes && USBRelayCommand::activeTimers[key] && !USBRelayCommand::shutdownFlag; i++) {
+        std::this_thread::sleep_for(std::chrono::minutes(1));
+    }
+
+    std::lock_guard<std::mutex> lock(USBRelayCommand::timerMutex);
+    if (USBRelayCommand::activeTimers[key] && !USBRelayCommand::shutdownFlag) {
+        int fd = open(device.c_str(), O_WRONLY | O_NOCTTY);
+        if (fd < 0) {
+            LogErr(VB_COMMAND, "Failed to open %s for auto-off: %s\n", device.c_str(), strerror(errno));
+        } else {
+            unsigned char cmd[4] = {0};
+            ssize_t len;
+            if (protocol == "CH340") {
+                cmd[0] = 0xA0;
+                cmd[1] = (unsigned char)channel;
+                cmd[2] = 0x00; // OFF
+                cmd[3] = cmd[0] + cmd[1] + cmd[2];
+                len = 4;
+            } else if (protocol == "ICstation") {
+                cmd[0] = getRelayBitmask(device, channel, false);
+                len = 1;
+            } else {
+                close(fd);
+                return;
+            }
+            if (write(fd, cmd, len) == len) {
+                LogDebug(VB_COMMAND, "Auto-turned off %s, channel %d\n", device.c_str(), channel);
+            } else {
+                LogErr(VB_COMMAND, "Failed to auto-turn off %s, channel %d: %s\n", device.c_str(), channel, strerror(errno));
+            }
+            close(fd);
+        }
+    }
+    USBRelayCommand::activeTimers.erase(key);
 }
 
 std::unique_ptr<Command::Result> USBRelayCommand::run(const std::vector<std::string>& args) {
     if (args.size() < 3) {
-        return std::make_unique<Command::ErrorResult>("Device, Channel, and State required");
+        return std::make_unique<Command::ErrorResult>("Device and State required, Channel optional");
     }
 
-    std::string device = "/dev/" + args[0];
-    int channel = std::stoi(args[1]);
+    std::string device = args[0];
     std::string state = args[2];
-    int duration = (args.size() > 3) ? std::stoi(args[3]) : 0;
+    std::string fullDevice = (device.find("/dev/") == 0) ? device : "/dev/" + device;
 
-    // Validate inputs
-    if (state != "ALL_ON" && state != "ALL_OFF") {
-        if (channel < 1 || channel > 8) {
-            return std::make_unique<Command::ErrorResult>("Channel must be 1-8 globally");
+    if (state == "ALL_OFF" || state == "ALL_ON") {
+        // Ignore channel input for ALL_ON/OFF
+        if (!args[1].empty()) {
+            LogWarn(VB_COMMAND, "Channel specified (%s) with %s, ignoring channel\n", args[1].c_str(), state.c_str());
         }
-        auto it = deviceChannelCount.find(device);
-        int maxChannels = (it != deviceChannelCount.end()) ? it->second : 8;
-        if (channel > maxChannels) {
-            return std::make_unique<Command::ErrorResult>("Channel " + std::to_string(channel) + " exceeds device limit of " + std::to_string(maxChannels));
-        }
-    }
-
-    if (state != "ON" && state != "OFF" && state != "ALL_ON" && state != "ALL_OFF") {
-        return std::make_unique<Command::ErrorResult>("State must be ON, OFF, ALL_ON, or ALL_OFF");
-    }
-
-    // Initialize device if not already done
-    if (relayStates.find(device) == relayStates.end()) {
-        initializeDevice(device);
-    }
-
-    // Handle the relay state
-    if (state == "ALL_ON" || state == "ALL_OFF") {
-        std::string protocol = deviceProtocol[device];
-        if (protocol == "ICstation") {
-            unsigned char bitmask = (state == "ALL_ON") ? 0xFF : 0x00;
-            int fd = open(device.c_str(), O_WRONLY | O_NOCTTY);
-            if (fd >= 0) {
-                if (write(fd, &bitmask, 1) != 1) {
-                    LogErr(VB_COMMAND, "Failed to set %s to %s: %s\n", device.c_str(), state.c_str(), strerror(errno));
-                }
-                else {
-                    LogDebug(VB_COMMAND, "Set %s to %s\n", device.c_str(), state.c_str());
-                    relayStates[device] = bitmask;
-                }
-                close(fd);
+        std::string resultStr = "Turned " + state.substr(4) + " all channels on: ";
+        std::lock_guard<std::mutex> lock(USBRelayCommand::timerMutex);
+        for (const auto& [dev, protoInfo] : USBRelayCommand::deviceProtocols) {
+            std::string devPath = (dev.find("/dev/") == 0) ? dev : "/dev/" + dev;
+            int fd = open(devPath.c_str(), O_WRONLY | O_NOCTTY);
+            if (fd < 0) {
+                LogErr(VB_COMMAND, "Failed to open %s for %s: %s\n", devPath.c_str(), state.c_str(), strerror(errno));
+                resultStr += dev + "(failed), ";
+                continue;
             }
-            else {
-                LogErr(VB_COMMAND, "Failed to open %s: %s\n", device.c_str(), strerror(errno));
-            }
-        }
-        else if (protocol == "CH340") {
-            auto it = deviceChannelCount.find(device);
-            int maxChannels = (it != deviceChannelCount.end()) ? it->second : 1;
-            for (int ch = 1; ch <= maxChannels; ch++) {
-                sendCH340Command(device, ch, state == "ALL_ON");
-            }
-        }
-    }
-    else {
-        if (state == "ON") {
-            turnOnRelay(device, channel);
-        }
-        else {
-            turnOffRelay(device, channel);
-        }
-    }
+            std::string protocol = protoInfo.first;
+            int channelCount = protoInfo.second;
 
-    // Schedule auto-off if ON or ALL_ON with duration
-    if ((state == "ON" || state == "ALL_ON") && duration > 0) {
-        std::string key = device + ":" + std::to_string(channel);
-        if (state == "ALL_ON") {
-            key = device + ":ALL";
-        }
-        if (activeTimers[key]) {
-            LogDebug(VB_COMMAND, "Timer already active for %s, channel %d, ignoring new timer\n", device.c_str(), channel);
-            return std::make_unique<Command::Result>("Relay channel " + args[1] + " already ON with active timer");
-        }
-        activeTimers[key] = true;
-        std::thread([key, device, channel, duration, state]() {
-            std::this_thread::sleep_for(std::chrono::seconds(duration));
-            if (activeTimers[key]) {
-                if (state == "ALL_ON") {
-                    std::string protocol = deviceProtocol[device];
-                    if (protocol == "ICstation") {
-                        unsigned char bitmask = 0x00;
-                        int fd = open(device.c_str(), O_WRONLY | O_NOCTTY);
-                        if (fd >= 0) {
-                            if (write(fd, &bitmask, 1) != 1) {
-                                LogErr(VB_COMMAND, "Failed to set %s to ALL_OFF: %s\n", device.c_str(), strerror(errno));
-                            }
-                            else {
-                                LogDebug(VB_COMMAND, "Auto-turned off %s (ALL_OFF)\n", device.c_str());
-                                relayStates[device] = bitmask;
-                            }
-                            close(fd);
-                        }
-                    }
-                    else if (protocol == "CH340") {
-                        auto it = deviceChannelCount.find(device);
-                        int maxChannels = (it != deviceChannelCount.end()) ? it->second : 1;
-                        for (int ch = 1; ch <= maxChannels; ch++) {
-                            sendCH340Command(device, ch, false);
-                        }
+            if (protocol == "CH340") {
+                for (int ch = 1; ch <= channelCount; ch++) {
+                    unsigned char cmd[4] = {0xA0, (unsigned char)ch, (state == "ALL_ON" ? 0x01 : 0x00), 0};
+                    cmd[3] = cmd[0] + cmd[1] + cmd[2];
+                    if (write(fd, cmd, 4) != 4) {
+                        LogErr(VB_COMMAND, "Failed to set channel %d on %s to %s: %s\n", ch, devPath.c_str(), state.c_str(), strerror(errno));
                     }
                 }
-                else {
-                    turnOffRelay(device, channel);
+            } else if (protocol == "ICstation") {
+                if (USBRelayCommand::relayStates.find(devPath) == USBRelayCommand::relayStates.end()) {
+                    initializeICStation(devPath);
                 }
-                activeTimers.erase(key);
-            }
-            }).detach();
-            LogDebug(VB_COMMAND, "Scheduled auto-off for %s, channel %d in %d seconds\n", device.c_str(), channel, duration);
-    }
-
-    return std::make_unique<Command::Result>("Relay " + (state == "ALL_ON" || state == "ALL_OFF" ? "all channels" : "channel " + args[1]) + " turned " + state);
-}
-
-Json::Value USBRelayCommand::getDescription() {
-    Json::Value desc;
-    desc["name"] = "USB Relay On/Off";
-    desc["description"] = "Controls USB relay with optional auto-off timer";
-    desc["version"] = "1.1"; // Force UI refresh
-    for (const auto& arg : args) {
-        Json::Value argDesc;
-        argDesc["name"] = arg.name;
-        argDesc["type"] = arg.type;
-        argDesc["description"] = arg.description;
-        argDesc["optional"] = arg.optional;
-        if (!arg.contentList.empty()) {
-            for (const auto& content : arg.contentList) {
-                argDesc["contents"].append(content);
-            }
-        }
-        if (arg.min != arg.max) {
-            argDesc["min"] = arg.min;
-            argDesc["max"] = arg.max;
-        }
-        if (!arg.defaultValue.empty()) {
-            argDesc["default"] = arg.defaultValue;
-        }
-        desc["args"].append(argDesc);
-    }
-    LogDebug(VB_COMMAND, "Generated description with %zu args\n", args.size());
-    return desc;
-}
-
-unsigned char USBRelayCommand::getRelayBitmask(const std::string& device, int channel, bool turnOn) {
-    if (relayStates.find(device) == relayStates.end()) {
-        relayStates[device] = 0x00;
-    }
-    unsigned char bitmask = relayStates[device];
-    if (turnOn) {
-        bitmask |= (1 << (channel - 1));
-    }
-    else {
-        bitmask &= ~(1 << (channel - 1));
-    }
-    relayStates[device] = bitmask;
-    return bitmask;
-}
-
-void USBRelayCommand::turnOnRelay(const std::string& device, int channel) {
-    std::string protocol = deviceProtocol[device];
-    if (protocol == "CH340") {
-        sendCH340Command(device, channel, true);
-    }
-    else {
-        unsigned char bitmask = getRelayBitmask(device, channel, true);
-        int fd = open(device.c_str(), O_WRONLY | O_NOCTTY);
-        if (fd >= 0) {
-            if (write(fd, &bitmask, 1) != 1) {
-                LogErr(VB_COMMAND, "Failed to turn on %s, channel %d: %s\n", device.c_str(), channel, strerror(errno));
-            }
-            else {
-                LogDebug(VB_COMMAND, "Turned on %s, channel %d\n", device.c_str(), channel);
+                USBRelayCommand::relayStates[devPath] = (state == "ALL_ON" ? 0xFF : 0x00); // All on (255) or all off (0)
+                if (write(fd, &USBRelayCommand::relayStates[devPath], 1) != 1) {
+                    LogErr(VB_COMMAND, "Failed to set all channels on %s to %s: %s\n", devPath.c_str(), state.c_str(), strerror(errno));
+                }
             }
             close(fd);
+            resultStr += dev + ", ";
         }
-        else {
-            LogErr(VB_COMMAND, "Failed to open %s: %s\n", device.c_str(), strerror(errno));
+        if (resultStr == "Turned " + state.substr(4) + " all channels on: ") {
+            return std::make_unique<Command::ErrorResult>("No devices configured for " + state);
         }
+        return std::make_unique<Command::Result>(resultStr.substr(0, resultStr.length() - 2));
     }
-}
 
-void USBRelayCommand::turnOffRelay(const std::string& device, int channel) {
-    std::string protocol = deviceProtocol[device];
+    if (args[1].empty()) {
+        return std::make_unique<Command::ErrorResult>("Channel required for ON or OFF");
+    }
+    int channel;
+    try {
+        channel = std::stoi(args[1]);
+    } catch (const std::exception& e) {
+        LogErr(VB_COMMAND, "Invalid channel value: %s\n", args[1].c_str());
+        return std::make_unique<Command::ErrorResult>("Invalid channel value: " + args[1]);
+    }
+    if (channel < 1 || channel > 8) {
+        return std::make_unique<Command::ErrorResult>("Channel must be 1-8");
+    }
+    if (state != "ON" && state != "OFF") {
+        return std::make_unique<Command::ErrorResult>("State must be ON or OFF");
+    }
+
+    int duration = (args.size() > 3 && !args[3].empty()) ? std::stoi(args[3]) : 0;
+    if (duration < 0) {
+        return std::make_unique<Command::ErrorResult>("Duration cannot be negative");
+    }
+
+    auto it = USBRelayCommand::deviceProtocols.find(device);
+    if (it == USBRelayCommand::deviceProtocols.end()) {
+        return std::make_unique<Command::ErrorResult>("Device " + device + " not configured");
+    }
+    std::string protocol = it->second.first;
+    int channelCount = it->second.second;
+    if (channel > channelCount) {
+        return std::make_unique<Command::ErrorResult>("Channel " + args[1] + " exceeds configured count for " + device);
+    }
+
+    LogDebug(VB_COMMAND, "Processing device %s, Channel %d, State %s, Protocol %s, Duration %d minutes\n", 
+             fullDevice.c_str(), channel, state.c_str(), protocol.c_str(), duration);
+
+    if (protocol == "ICstation" && USBRelayCommand::relayStates.find(fullDevice) == USBRelayCommand::relayStates.end()) {
+        initializeICStation(fullDevice);
+    }
+
+    int fd = open(fullDevice.c_str(), O_WRONLY | O_NOCTTY);
+    if (fd < 0) {
+        LogErr(VB_COMMAND, "Failed to open %s: %s\n", fullDevice.c_str(), strerror(errno));
+        return std::make_unique<Command::ErrorResult>("Failed to open device " + device);
+    }
+
+    unsigned char cmd[4] = {0};
+    ssize_t len;
     if (protocol == "CH340") {
-        sendCH340Command(device, channel, false);
+        cmd[0] = 0xA0;
+        cmd[1] = (unsigned char)channel;
+        cmd[2] = (state == "ON") ? 0x01 : 0x00;
+        cmd[3] = cmd[0] + cmd[1] + cmd[2];
+        len = 4;
+    } else if (protocol == "ICstation") {
+        cmd[0] = getRelayBitmask(fullDevice, channel, state == "ON");
+        len = 1;
+    } else {
+        close(fd);
+        return std::make_unique<Command::ErrorResult>("Unsupported protocol for " + device);
     }
-    else {
-        unsigned char bitmask = getRelayBitmask(device, channel, false);
-        int fd = open(device.c_str(), O_WRONLY | O_NOCTTY);
-        if (fd >= 0) {
-            if (write(fd, &bitmask, 1) != 1) {
-                LogErr(VB_COMMAND, "Failed to turn off %s, channel %d: %s\n", device.c_str(), channel, strerror(errno));
-            }
-            else {
-                LogDebug(VB_COMMAND, "Auto-turned off %s, channel %d\n", device.c_str(), channel);
-            }
-            close(fd);
+
+    if (write(fd, cmd, len) != len) {
+        LogErr(VB_COMMAND, "Failed to write to %s: %s\n", fullDevice.c_str(), strerror(errno));
+        close(fd);
+        return std::make_unique<Command::ErrorResult>("Failed to set relay channel " + args[1] + " to " + state);
+    }
+    LogDebug(VB_COMMAND, "Successfully wrote %zd bytes to %s\n", len, fullDevice.c_str());
+    close(fd);
+
+    std::lock_guard<std::mutex> lock(USBRelayCommand::timerMutex);
+    std::string key = fullDevice + ":" + std::to_string(channel);
+    if (state == "ON" && duration > 0) {
+        if (USBRelayCommand::timerThreads.count(key) && USBRelayCommand::timerThreads[key].joinable()) {
+            USBRelayCommand::activeTimers[key] = false;
+            USBRelayCommand::timerThreads[key].join();
+            USBRelayCommand::timerThreads.erase(key);
         }
-        else {
-            LogErr(VB_COMMAND, "Failed to open %s: %s\n", device.c_str(), strerror(errno));
+        USBRelayCommand::activeTimers[key] = true;
+        USBRelayCommand::timerThreads[key] = std::thread([fullDevice, channel, protocol, duration, key]() {
+            turnOffAfterDelay(fullDevice, channel, protocol, duration, key);
+        });
+        return std::make_unique<Command::Result>("Relay channel " + args[1] + " turned ON for " + std::to_string(duration) + " minutes");
+    } else if (state == "OFF") {
+        USBRelayCommand::activeTimers[key] = false;
+        if (USBRelayCommand::timerThreads.count(key) && USBRelayCommand::timerThreads[key].joinable()) {
+            USBRelayCommand::timerThreads[key].join();
+            USBRelayCommand::timerThreads.erase(key);
         }
     }
+
+    return std::make_unique<Command::Result>("Relay channel " + args[1] + " turned " + state);
 }
 
-// Plugin registration
-USBRelayPlugin::USBRelayPlugin() : FPPPlugin("FPP-USB-Relay-Ctrl") {
-    LogDebug(VB_COMMAND, "Registering USB Relay On/Off command\n");
-    CommandManager::INSTANCE.addCommand(new USBRelayCommand());
+void cleanupThreads() {
+    std::lock_guard<std::mutex> lock(USBRelayCommand::timerMutex);
+    USBRelayCommand::shutdownFlag = true;
+    for (auto& [key, thread] : USBRelayCommand::timerThreads) {
+        if (thread.joinable()) {
+            USBRelayCommand::activeTimers[key] = false;
+            thread.join();
+        }
+    }
+    USBRelayCommand::timerThreads.clear();
+    USBRelayCommand::activeTimers.clear();
+    LogDebug(VB_COMMAND, "All USB relay timer threads cleaned up\n");
 }
 
-USBRelayPlugin::~USBRelayPlugin() {
-    LogDebug(VB_COMMAND, "Unregistering USB Relay On/Off command\n");
-    CommandManager::INSTANCE.removeCommand("USB Relay On/Off");
-}
+class USBRelayPlugin : public FPPPlugin {
+public:
+    USBRelayPlugin() : FPPPlugin("FPP-USB-Relay-Ctrl") {
+        plugin_init();
+    }
+    ~USBRelayPlugin() {}
+};
 
-extern "C" FPPPlugin * createPlugin() {
-    LogDebug(VB_COMMAND, "Creating FPP-USB-Relay-Ctrl plugin\n");
+extern "C" FPPPlugin* createPlugin() {
     return new USBRelayPlugin();
+}
+
+extern "C" __attribute__((visibility("default"))) void plugin_init() {
+    CommandManager::INSTANCE.addCommand(new USBRelayCommand());
+    LogDebug(VB_PLUGIN, "Initialized FPP-USB-Relay-Ctrl plugin\n");
+}
+
+extern "C" __attribute__((visibility("default"))) void plugin_cleanup() {
+    cleanupThreads();
+    CommandManager::INSTANCE.removeCommand("USB Relay On/Off");
+    LogDebug(VB_PLUGIN, "Cleaned up FPP-USB-Relay-Ctrl plugin\n");
 }
