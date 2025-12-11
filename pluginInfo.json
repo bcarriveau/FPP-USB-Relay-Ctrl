@@ -1,0 +1,22 @@
+{
+  "repoName": "FPP-USB-Relay-Ctrl",
+  "name": "USB Relay Ctrl Plugin",
+  "author": "Bill Carriveau",
+  "description": "Adds USB Relay On/Off/AutoOff command with timed shutdown for CH340 & ICStation relays",
+  "homeURL": "https://github.com/bcarriveau/FPP-USB-Relay-Ctrl",
+  "srcURL": "https://github.com/bcarriveau/FPP-USB-Relay-Ctrl.git",
+  "bugURL": "https://github.com/bcarriveau/FPP-USB-Relay-Ctrl/issues",
+  "allowUpdates": 1,
+  "installScript": "scripts/fpp_install.sh",
+  "longDescription": "Provides a reliable FPP command to control USB relay boards (CH340 & ICStation). Supports single channel, all channels, and timed auto-off in minutes. Perfect for fire-safe shutdowns, show effects, and remote props.",
+  "platforms": "all",
+  "variants": ["pi","bbb"],
+  "versions": [
+    {
+      "minFPPVersion": "8.0",
+      "maxFPPVersion": "9.9",
+      "branch": "main",
+      "sha": ""
+    }
+  ]
+}
